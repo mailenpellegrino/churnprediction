@@ -1,0 +1,89 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt 
+
+#El archivo de userID's con fechas de sesiones hay que descargarlo haciendo una consulta en BigQuery
+
+rawData = pd.read_csv(r"XXXXX.csv")
+
+data = rawData.iloc[:,0:2]
+#Definir a la fecha como fecha
+data.iloc[:,0] = pd.to_datetime(data.iloc[:,0], format='%Y%m%d')
+#Ordenar los valores por UserID y fecha
+data = data.sort_values(by=['userID', 'date']).reset_index(drop=True)
+
+#Dividir la muestra en 2: una para entrenar el modelo y otra para chequear
+start_date = '2018-07-01'
+end_date = '2018-09-30'
+mask = (data['date'] >= start_date) & (data['date'] <= end_date)
+
+JulioAgostoSeptiembre = data.loc[mask]
+JulioAgostoSeptiembre = JulioAgostoSeptiembre.sort_values(by=['userID', 'date']).reset_index(drop=True)
+
+OctumbreNoviembre = data.loc[-mask].sort_values(by=['userID', 'date']).reset_index(drop=True)
+
+#Con el diff() calculamos las ventanas de tiempo entre cada ingreso de cada usuario.
+
+JulioAgostoSeptiembre["window"] = JulioAgostoSeptiembre.groupby(["userID"]).diff()
+
+#Descarto los usuarios que entraron una sola vez ya que no tienen ni una sola ventana de tiempo.
+
+windowTime = JulioAgostoSeptiembre.iloc[:, 1:3].dropna().reset_index(drop=True)
+
+#Agrupando por usuario se calcula la media y el desvío para cada usuario
+
+grouped = windowTime.groupby('userID')['window']
+
+mean = (grouped.apply(lambda x: np.mean(x))).reset_index()
+std = (grouped.apply(lambda x: np.std(x, ddof=1))).reset_index()
+mean = mean.rename(columns={"window":"mean"})
+std = std.rename(columns={"window":"std"})
+
+#Me armo una tabla que tenga estos datos
+estadisticos = mean.merge(std, on='userID', how='inner')
+
+#Me armo una tabla que tenga la última fecha en la que entró cada usuario en el período de training del modelo.
+
+timeMaxUsers = JulioAgostoSeptiembre.groupby(["userID"]).max()
+timeMaxUsers = timeMaxUsers.reset_index()
+timeMaxUsers = timeMaxUsers.rename(columns={"date":"maxDate"})
+timeMaxUsers["userID"] = timeMaxUsers["userID"].astype(np.int32)
+
+#Armo una tabla que tenga los datos de desvío, media y última fecha de ingreso.
+
+users = estadisticos.merge(timeMaxUsers, on='userID', how='inner')
+#Descarto quienes tengan desvío nulo, es decir, tienen una sola ventana de tiempo.
+users = users.fillna("0 days 00:00:00.000000000")
+#Agrego una columna que me diga para cada usuario si entró o no en el período de prueba
+users["churn"] = UsersOctubreNoviembre["userID"].isin(users["userID"])
+users["churn"] = np.where(users["churn"]==True, "no", "yes")
+
+#El modelo finalmente es considerar churn a aquellos usuarios que para el último día del período de training no hayan entrado con la frecuencia que solían entrar
+#Esta "frecuencia con la que solían entrar" es lo que se calcula abajo usando un doble loop. El loop es para ver qué combinación lineal entre la media y el desvío resulta más eficiente.
+
+
+bestPrecision = 0
+bestModelB = 0
+bestModelA = 0
+bestRecall = 0
+def frange(start, stop, step):
+    i = start
+    while i < stop:
+        yield i
+        i += step
+        
+for a in frange(1, 5, 0.1):
+    for b in frange(1, 5, 0.1):
+        usersbis = users
+        usersbis["model"] = a*usersbis["mean"]+b*usersbis["std"]+usersbis["maxDate"]
+        usersbis["prediction"] =  np.where(pd.to_datetime(usersbis["model"]) < pd.to_datetime('2018-10-01'),"yes","no")
+        TruePositives = usersbis[((usersbis["churn"]==usersbis["prediction"]) & (usersbis["churn"]=='yes'))].count()
+        FalsePositives = usersbis[((usersbis["churn"]!=usersbis["prediction"]) & (usersbis["churn"]=='no'))].count()
+        FalseNegatives = usersbis[((usersbis["churn"]!=usersbis["prediction"]) & (usersbis["churn"]=='yes'))].count()
+        precision = TruePositives[1]/(TruePositives[1]+FalsePositives[1]) 
+        recall = TruePositives[1]/(TruePositives[1]+FalseNegatives[1]) 
+        if recall>bestRecall:
+            bestPrecision = precision 
+            bestModelB = b
+            bestModelA = a
+            bestRecall = recall
